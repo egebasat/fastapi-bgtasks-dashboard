@@ -14,6 +14,9 @@ _ws_lock = threading.Lock()
 # Store actual function objects for rerun
 _registered_funcs: dict = {}
 
+# Max tasks limit
+_max_tasks: int = 10000
+
 router = APIRouter()
 
 
@@ -90,13 +93,15 @@ def _wrap_task(func, *args, **kwargs):
             "ended_at": None,
             "params": bound_params,
         }
+
     _broadcast_update()
 
     def _runner():
         nonlocal started_at, ended_at
         with _tasks_lock:
-            _tasks[task_id]["status"] = "running"
-            _tasks[task_id]["started_at"] = datetime.utcnow()
+            if task_id in _tasks:
+                _tasks[task_id]["status"] = "running"
+                _tasks[task_id]["started_at"] = datetime.utcnow()
         _broadcast_update()
 
         try:
@@ -109,16 +114,38 @@ def _wrap_task(func, *args, **kwargs):
                 else:
                     asyncio.get_event_loop().run_until_complete(result)
             with _tasks_lock:
-                _tasks[task_id]["status"] = "finished"
+                if task_id in _tasks:
+                    _tasks[task_id]["status"] = "finished"
         except Exception as e:
             tb = traceback.format_exc()
             with _tasks_lock:
-                _tasks[task_id]["status"] = f"failed: {str(e)}"
-                _tasks[task_id]["error_trace"] = tb
+                if task_id in _tasks:
+                    _tasks[task_id]["status"] = f"failed: {str(e)}"
+                    _tasks[task_id]["error_trace"] = tb
         finally:
             ended_at = datetime.utcnow()
             with _tasks_lock:
-                _tasks[task_id]["ended_at"] = ended_at
+                if task_id in _tasks:
+                    _tasks[task_id]["ended_at"] = ended_at
+
+                # Enforce max tasks limit after task completion
+                if len(_tasks) > _max_tasks:
+                    # Sort tasks by ended_at, then started_at (oldest first)
+                    # Prioritize removing completed tasks over running ones
+                    tasks_by_time = sorted(
+                        _tasks.items(),
+                        key=lambda x: (
+                            x[1].get("ended_at") or datetime.max,
+                            x[1].get("started_at") or datetime.max
+                        )
+                    )
+                    # Remove oldest completed tasks to get back to limit
+                    num_to_remove = len(_tasks) - _max_tasks
+                    for i in range(num_to_remove):
+                        # Only remove tasks that have ended
+                        if tasks_by_time[i][1].get("ended_at"):
+                            del _tasks[tasks_by_time[i][0]]
+
             _broadcast_update()
 
     return _runner
